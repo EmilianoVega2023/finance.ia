@@ -1,22 +1,3 @@
-# finance.ia
-learning
-
-Día 1 — Vectores aplicados a rendimientos
-
-Duración: 1.5 h
-
-Parte 1 (30 min)
-
-Repasar conceptualmente:
-
-Vector = lista ordenada de números.
-
-Retornos diarios = vector.
-
-Portafolio = combinación lineal de vectores.
-
-Eso es álgebra lineal aplicada a finanzas.
-
 Parte 2 (1 h práctica)
 
 En NumPy:
