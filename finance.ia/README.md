@@ -1,41 +1,124 @@
-# finance.ia
-learning
+Parte 2 (1 h práctica)
 
-Día 1 — Setup profesional
+En NumPy:
 
-Instalá / verificá:
+Descargar precios de AAPL.
 
-Python 3.11+
+Calcular retornos diarios.
 
-VS Code
+Guardarlos en un vector.
 
-Git
+Calcular:
 
-Crear cuenta GitHub
+media
 
-Crear entorno virtual
+desviación estándar
 
-Instalar:
+producto punto entre retornos de AAPL y SPY
 
-numpy
+Interpretación:
+Si el producto punto es alto → se mueven parecido.
 
-pandas
+Ahí entendés correlación geométrica.
 
-matplotlib
+No es matemática abstracta.
+Es riesgo de mercado.
 
-yfinance
+Día 2 — Introducción real a balances
 
-Comando típico:
+Acá empezamos a construir ventaja competitiva.
 
-pip install numpy pandas matplotlib yfinance
+Leer un balance no es “saber contabilidad”.
+Es entender:
+
+Revenue (ingresos)
+
+Net Income (ganancia neta)
+
+Free Cash Flow
+
+Debt
+
+ROE
+
+Margen operativo
+
+Te recomiendo empezar con una empresa conocida:
+
+Apple Inc.
+
+Buscar su:
+
+Income Statement
+
+Balance Sheet
+
+Cash Flow Statement
+
+Objetivo del día:
+Entender cómo crecen los ingresos y el flujo de caja en los últimos 5 años.
+
+Nada más.
+
+🔹 Sobre tu idea tipo Buffett
+
+Importante.
+
+Warren Buffett no usa magia.
+Usa principios:
+
+Ventaja competitiva duradera
+
+ROE alto sostenido
+
+Baja deuda relativa
+
+Flujo de caja predecible
+
+Buen management
+
+Eso se puede cuantificar.
+
+De hecho, lo que estás imaginando se llama:
+
+Value Investing Quantitativo.
+
+Se puede modelar con:
+
+Screener fundamental
+
+Scoring multi-factor
+
+Descuento de flujos (DCF)
+
+Clasificación con ML
+
+Y acá aparece algo potente:
+
+Podrías construir un modelo que:
+
+Lea estados financieros
+
+Extraiga métricas clave
+
+Asigne score de “calidad tipo Buffett”
+
+Eso sí es un proyecto con identidad.
+
+🔹 Pero ordenemos prioridades
+
+Primero:
+Base matemática + manipulación de datos.
 
 Después:
+Automatización de métricas fundamentales.
 
-Crear repo: ai-finance-lab
+Después:
+Modelo predictivo o de scoring.
 
-Subir README simple explicando el proyecto.
+No al revés.
 
-Ya empezás como profesional.
+--------------------------
 
 Día 2 — Vectores en la práctica (álgebra aplicada)
 
