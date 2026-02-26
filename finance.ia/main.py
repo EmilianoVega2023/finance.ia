@@ -46,7 +46,7 @@ warnings.filterwarnings("ignore")
 # CONFIGURACIÓN GLOBAL
 # =============================================================================
 
-TICKERS      = ["YPF", "GGAL", "MSFT", "GOLD", "AAPL", "AMZN", "TSLA"]
+TICKERS      = ["META", "WLM", "MSFT", "GOLD", "AAPL", "AMZN", "TSLA", "NVDA", "JPM", "V", "UNH", "HD", "PG", "DIS", "MA", "BAC", "XOM", "KO", "PFE"]
 BENCHMARK    = "SPY"
 START_DATE   = "2015-01-01"
 END_DATE     = pd.Timestamp.today().strftime("%Y-%m-%d")
@@ -388,20 +388,10 @@ def train_model(dataset: pd.DataFrame) -> RandomForestClassifier:
         - Train: primeros 80% de observaciones (ordenadas por fecha)
         - Test:  últimos 20%
 
-    Features usadas:
-        Precio    : log_return, volatility_60, beta_60, momentum_126
-        Fundamental: revenue_growth, roe, fcf_yield, debt_to_equity
-
     Métricas reportadas:
-        - Accuracy, Precision, Recall (macro)
-        - Reporte de clasificación completo
-        - Feature importance (impurity-based + permutation)
-
-    Args:
-        dataset : DataFrame con features y columna 'target'
-
-    Returns:
-        Modelo entrenado (RandomForestClassifier).
+        Clasificación : Accuracy, Precision, Recall, reporte completo
+        Financieras   : Sharpe ratio de la estrategia, análisis de
+                        falsos positivos y alpha generado
     """
     print("\n[5/5] Entrenando modelo...")
 
@@ -410,14 +400,12 @@ def train_model(dataset: pd.DataFrame) -> RandomForestClassifier:
         "revenue_growth", "roe", "fcf_yield", "debt_to_equity",
     ]
 
-    # Usar solo features disponibles en el dataset
     available_features = [c for c in FEATURE_COLS if c in dataset.columns]
 
     # Ordenar cronológicamente para respetar el split temporal
     df = dataset.sort_index(level="date").copy()
 
-    # Imputar NaN en fundamentals con mediana de cada feature
-    # (muchos activos no tienen fundamentals; rellenar evita perder filas)
+    # Imputar NaN en fundamentals con mediana (activos sin balance sheet)
     for col in ["revenue_growth", "roe", "fcf_yield", "debt_to_equity"]:
         if col in df.columns:
             df[col] = df[col].fillna(df[col].median())
@@ -431,40 +419,52 @@ def train_model(dataset: pd.DataFrame) -> RandomForestClassifier:
     y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
 
     print(f"    Train: {len(X_train)} muestras  |  Test: {len(X_test)} muestras")
-    #agregado para análisis de estrategia reciente
-    dataset["strategy_return"] = dataset["alpha"] * y_pred
-    dataset["benchmark_alpha"] = dataset["alpha"]
-    mean_ret = dataset["strategy_return"].mean()
-    vol = dataset["strategy_return"].std()
-    sharpe = mean_ret / vol
-    dataset["false_positive"] = (
-    (y_pred == 1) & (dataset["alpha"] < 0)
-    )
-    dataset["fp_loss"] = dataset["alpha"] * dataset["false_positive"]
+
     # --- Modelo ---
     model = RandomForestClassifier(
         n_estimators=300,
         max_depth=6,
-        min_samples_leaf=20,      # evitar overfitting
+        min_samples_leaf=20,
         max_features="sqrt",
-        class_weight="balanced",  # maneja desbalance de clases
+        class_weight="balanced",
         random_state=42,
-        n_jobs=-1,
+        n_jobs=1,           # n_jobs=1 evita errores de multiprocessing en Windows
     )
     model.fit(X_train, y_train)
-    # Probabilidades
-    y_proba = model.predict_proba(X_test)[:, 1]
 
-# Umbral configurable
+    # --- Predicciones con umbral configurable ---
+    # Usar probabilidades permite controlar el tradeoff precision/recall:
+    # subir el umbral reduce falsos positivos a costa de menos señales.
     PROBA_THRESHOLD = 0.60
-    y_pred = (y_proba > PROBA_THRESHOLD).astype(int)
-    dataset_test = dataset.loc[X_test.index].copy()
-    dataset_test["y_true"] = y_test
+    y_proba = model.predict_proba(X_test)[:, 1]
+    y_pred  = (y_proba >= PROBA_THRESHOLD).astype(int)
+
+    # --- Dataset de test enriquecido para métricas financieras ---
+    dataset_test = df.iloc[split_idx:].copy()
+    dataset_test["y_true"]  = y_test.values
     dataset_test["y_proba"] = y_proba
-    dataset_test["y_pred"] = y_pred
-    # --- Métricas ---
-    
-    y_pred = model.predict(X_test)
+    dataset_test["y_pred"]  = y_pred
+
+    # --- Métricas financieras (solo sobre el test set) ---
+    # strategy_return = alpha cuando el modelo predice 1, 0 cuando predice 0
+    dataset_test["strategy_return"] = dataset_test["alpha"] * dataset_test["y_pred"]
+
+    mean_ret = dataset_test["strategy_return"].mean()
+    vol      = dataset_test["strategy_return"].std()
+    sharpe   = mean_ret / vol if vol != 0 else 0.0
+
+    # Falsos positivos: modelo predijo 1 pero el alpha fue negativo
+    dataset_test["false_positive"] = (
+        (dataset_test["y_pred"] == 1) & (dataset_test["alpha"] < 0)
+    )
+    dataset_test["fp_loss"] = dataset_test["alpha"] * dataset_test["false_positive"]
+
+    fp_count    = dataset_test["false_positive"].sum()
+    fp_total    = (dataset_test["y_pred"] == 1).sum()
+    fp_rate     = fp_count / fp_total if fp_total > 0 else 0.0
+    avg_fp_loss = dataset_test["fp_loss"].mean()
+
+    # --- Métricas de clasificación estándar ---
     acc  = accuracy_score(y_test, y_pred)
     prec = precision_score(y_test, y_pred, average="macro", zero_division=0)
     rec  = recall_score(y_test, y_pred, average="macro", zero_division=0)
@@ -472,11 +472,19 @@ def train_model(dataset: pd.DataFrame) -> RandomForestClassifier:
     print("\n" + "=" * 55)
     print("  RESULTADOS DEL MODELO")
     print("=" * 55)
-    print(f"  Accuracy  : {acc:.4f}")
-    print(f"  Precision : {prec:.4f}  (macro)")
-    print(f"  Recall    : {rec:.4f}  (macro)")
+    print(f"  Umbral de probabilidad : {PROBA_THRESHOLD}")
+    print(f"  Accuracy               : {acc:.4f}")
+    print(f"  Precision (macro)      : {prec:.4f}")
+    print(f"  Recall    (macro)      : {rec:.4f}")
     print("\n  Reporte completo (test set):")
     print(classification_report(y_test, y_pred, zero_division=0))
+    print("=" * 55)
+    print("  MÉTRICAS FINANCIERAS (test set)")
+    print("=" * 55)
+    print(f"  Sharpe ratio estrategia  : {sharpe:.4f}")
+    print(f"  Señales emitidas (pred=1): {int(fp_total)}")
+    print(f"  Falsos positivos         : {int(fp_count)}  ({fp_rate:.1%} de señales)")
+    print(f"  Pérdida media por FP     : {avg_fp_loss:.4f}")
     print("=" * 55)
 
     # --- Feature Importance ---
@@ -512,7 +520,7 @@ def _plot_feature_importance(
     axes[0].axvline(0, color="black", linewidth=0.8)
 
     # --- Permutation importance ---
-    perm = permutation_importance(model, X_test, y_test, n_repeats=15, random_state=42, n_jobs=-1)
+    perm = permutation_importance(model, X_test, y_test, n_repeats=15, random_state=42, n_jobs=1)
     perm_imp = pd.Series(perm.importances_mean, index=feature_names).sort_values()
     colors_perm = ["#2196F3" if i < 0 else "#4CAF50" for i in perm_imp]
     perm_imp.plot(kind="barh", ax=axes[1], color=colors_perm, xerr=perm.importances_std[perm_imp.index.map(
