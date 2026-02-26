@@ -39,20 +39,20 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score, precision_score, recall_score, classification_report
 from sklearn.inspection import permutation_importance
 
+
 warnings.filterwarnings("ignore")
 
 # =============================================================================
 # CONFIGURACIÓN GLOBAL
 # =============================================================================
 
-TICKERS      = ["YPF", "GGAL", "MSFT", "GOLD", "BTC-USD"]
+TICKERS      = ["YPF", "GGAL", "MSFT", "GOLD", "AAPL", "AMZN", "TSLA"]
 BENCHMARK    = "SPY"
 START_DATE   = "2015-01-01"
 END_DATE     = pd.Timestamp.today().strftime("%Y-%m-%d")
 HORIZON      = 63          # días hábiles ≈ 3 meses
 VOL_WINDOW   = 60          # ventana para volatilidad y beta rolling
 MOM_WINDOW   = 126         # ventana para momentum 6 meses
-
 
 
 # Rutas de salida
@@ -144,9 +144,6 @@ def _build_fundamentals_df(ticker: str) -> pd.DataFrame:
         DataFrame con índice DatetimeIndex (fechas de reporte anuales).
         Vacío para BTC-USD (sin estados financieros).
     """
-    skip_tickers = {"BTC-USD"}
-    if ticker in skip_tickers:
-        return pd.DataFrame()
 
     try:
         t = yf.Ticker(ticker)
@@ -348,16 +345,24 @@ def build_target(prices: pd.DataFrame, features: pd.DataFrame) -> pd.DataFrame:
         if ticker not in prices.columns:
             continue
         ticker_forward = np.log(prices[ticker].shift(-HORIZON) / prices[ticker])
+        
         # Comparar retorno futuro del activo vs SPY
-        outperforms = (ticker_forward > spy_forward).astype(float)
+        ALPHA_THRESHOLD = 0.005  # 0.5%
+
+        alpha = ticker_forward - spy_forward
+        outperforms = (alpha > ALPHA_THRESHOLD).astype(float)
         outperforms.name = "target"
         # Asignar al MultiIndex correspondiente
         idx = dataset.xs(ticker, level="ticker").index
         dataset.loc[(idx, ticker), "target"] = outperforms.reindex(idx).values
+        dataset.loc[(idx, ticker), "future_return"] = ticker_forward.reindex(idx).values
+        dataset.loc[(idx, ticker), "benchmark_forward"] = spy_forward.reindex(idx).values
 
     # Eliminar filas sin target (últimos HORIZON días y NaNs de features)
+    dataset["alpha"] = dataset["future_return"] - dataset["benchmark_forward"]
     dataset = dataset.dropna(subset=["target"])
     dataset["target"] = dataset["target"].astype(int)
+    
 
     # Eliminar filas donde alguna feature de precio sea NaN
     price_features = ["log_return", "volatility_60", "beta_60", "momentum_126"]
@@ -365,15 +370,16 @@ def build_target(prices: pd.DataFrame, features: pd.DataFrame) -> pd.DataFrame:
 
     dataset.to_csv(DATASET_CSV)
     print(f"    → Dataset final guardado en {DATASET_CSV}  |  Shape: {dataset.shape}")
-    print(f"    → Distribución del target:\n{dataset['target'].value_counts().to_string()}")
-
+    print(f"    → Distribución del target:\n{dataset['target'].value_counts(normalize=True)}")
+    
     return dataset
 
+    
 
 # =============================================================================
 # 5. ENTRENAMIENTO DEL MODELO
 # =============================================================================
-
+    
 def train_model(dataset: pd.DataFrame) -> RandomForestClassifier:
     """
     Entrena un RandomForestClassifier con split temporal (walk-forward).
@@ -425,7 +431,16 @@ def train_model(dataset: pd.DataFrame) -> RandomForestClassifier:
     y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
 
     print(f"    Train: {len(X_train)} muestras  |  Test: {len(X_test)} muestras")
-
+    #agregado para análisis de estrategia reciente
+    dataset["strategy_return"] = dataset["alpha"] * y_pred
+    dataset["benchmark_alpha"] = dataset["alpha"]
+    mean_ret = dataset["strategy_return"].mean()
+    vol = dataset["strategy_return"].std()
+    sharpe = mean_ret / vol
+    dataset["false_positive"] = (
+    (y_pred == 1) & (dataset["alpha"] < 0)
+    )
+    dataset["fp_loss"] = dataset["alpha"] * dataset["false_positive"]
     # --- Modelo ---
     model = RandomForestClassifier(
         n_estimators=300,
@@ -437,10 +452,19 @@ def train_model(dataset: pd.DataFrame) -> RandomForestClassifier:
         n_jobs=-1,
     )
     model.fit(X_train, y_train)
+    # Probabilidades
+    y_proba = model.predict_proba(X_test)[:, 1]
 
+# Umbral configurable
+    PROBA_THRESHOLD = 0.60
+    y_pred = (y_proba > PROBA_THRESHOLD).astype(int)
+    dataset_test = dataset.loc[X_test.index].copy()
+    dataset_test["y_true"] = y_test
+    dataset_test["y_proba"] = y_proba
+    dataset_test["y_pred"] = y_pred
     # --- Métricas ---
+    
     y_pred = model.predict(X_test)
-
     acc  = accuracy_score(y_test, y_pred)
     prec = precision_score(y_test, y_pred, average="macro", zero_division=0)
     rec  = recall_score(y_test, y_pred, average="macro", zero_division=0)
