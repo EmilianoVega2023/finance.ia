@@ -1,4 +1,8 @@
-Parte 2 (1 h práctica)
+API comand:
+pip install -r requirements.txt
+export FMP_API_KEY="?apikey=saHv6pVcfJ7jpsqSle8U50fR61AUIHc7"   
+python main.py
+
 
 En NumPy:
 
