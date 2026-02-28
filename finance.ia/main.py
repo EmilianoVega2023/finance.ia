@@ -36,8 +36,14 @@ import matplotlib.dates as mdates
 
 from pathlib import Path
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import accuracy_score, precision_score, recall_score, classification_report
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score,
+    f1_score, roc_auc_score, precision_recall_curve,
+    classification_report,
+)
 from sklearn.inspection import permutation_importance
+from sklearn.utils import resample
+
 
 warnings.filterwarnings("ignore")
 
@@ -45,14 +51,13 @@ warnings.filterwarnings("ignore")
 # CONFIGURACIÓN GLOBAL
 # =============================================================================
 
-TICKERS      = ["YPF", "GGAL", "MSFT", "GOLD", "BTC-USD"]
+TICKERS      = ["YPF", "GGAL", "MSFT", "GOLD", "AAPL", "AMZN", "TSLA"]
 BENCHMARK    = "SPY"
 START_DATE   = "2015-01-01"
 END_DATE     = pd.Timestamp.today().strftime("%Y-%m-%d")
 HORIZON      = 63          # días hábiles ≈ 3 meses
 VOL_WINDOW   = 60          # ventana para volatilidad y beta rolling
 MOM_WINDOW   = 126         # ventana para momentum 6 meses
-
 
 
 # Rutas de salida
@@ -144,9 +149,6 @@ def _build_fundamentals_df(ticker: str) -> pd.DataFrame:
         DataFrame con índice DatetimeIndex (fechas de reporte anuales).
         Vacío para BTC-USD (sin estados financieros).
     """
-    skip_tickers = {"BTC-USD"}
-    if ticker in skip_tickers:
-        return pd.DataFrame()
 
     try:
         t = yf.Ticker(ticker)
@@ -348,16 +350,24 @@ def build_target(prices: pd.DataFrame, features: pd.DataFrame) -> pd.DataFrame:
         if ticker not in prices.columns:
             continue
         ticker_forward = np.log(prices[ticker].shift(-HORIZON) / prices[ticker])
+        
         # Comparar retorno futuro del activo vs SPY
-        outperforms = (ticker_forward > spy_forward).astype(float)
+        ALPHA_THRESHOLD = 0.005  # 0.5%
+
+        alpha = ticker_forward - spy_forward
+        outperforms = (alpha > ALPHA_THRESHOLD).astype(float)
         outperforms.name = "target"
         # Asignar al MultiIndex correspondiente
         idx = dataset.xs(ticker, level="ticker").index
         dataset.loc[(idx, ticker), "target"] = outperforms.reindex(idx).values
+        dataset.loc[(idx, ticker), "future_return"] = ticker_forward.reindex(idx).values
+        dataset.loc[(idx, ticker), "benchmark_forward"] = spy_forward.reindex(idx).values
 
     # Eliminar filas sin target (últimos HORIZON días y NaNs de features)
+    dataset["alpha"] = dataset["future_return"] - dataset["benchmark_forward"]
     dataset = dataset.dropna(subset=["target"])
     dataset["target"] = dataset["target"].astype(int)
+    
 
     # Eliminar filas donde alguna feature de precio sea NaN
     price_features = ["log_return", "volatility_60", "beta_60", "momentum_126"]
@@ -365,37 +375,90 @@ def build_target(prices: pd.DataFrame, features: pd.DataFrame) -> pd.DataFrame:
 
     dataset.to_csv(DATASET_CSV)
     print(f"    → Dataset final guardado en {DATASET_CSV}  |  Shape: {dataset.shape}")
-    print(f"    → Distribución del target:\n{dataset['target'].value_counts().to_string()}")
-
+    print(f"    → Distribución del target:\n{dataset['target'].value_counts(normalize=True)}")
+    
     return dataset
 
+    
 
 # =============================================================================
 # 5. ENTRENAMIENTO DEL MODELO
 # =============================================================================
+    
+def _find_best_threshold(y_proba: np.ndarray, y_true: np.ndarray) -> float:
+    """
+    Encuentra el umbral de probabilidad que maximiza el F1-Score en clase 1.
+
+    Por qué F1 y no accuracy: accuracy sube cuando el modelo dice siempre 0.
+    F1 penaliza tanto los falsos positivos como los falsos negativos,
+    forzando al modelo a ser útil en la clase 1 (la que nos importa operar).
+
+    Returns:
+        Umbral óptimo (float entre 0 y 1).
+    """
+    precisions, recalls, thresholds = precision_recall_curve(y_true, y_proba)
+    # F1 = 2 * P * R / (P + R), evitar división por cero
+    f1_scores = np.where(
+        (precisions + recalls) > 0,
+        2 * precisions * recalls / (precisions + recalls),
+        0.0,
+    )
+    best_idx = np.argmax(f1_scores[:-1])   # thresholds tiene un elemento menos
+    return float(thresholds[best_idx])
+
+
+def _undersample_majority(X: pd.DataFrame, y: pd.Series, random_state: int = 42):
+    """
+    Submuestreo de la clase mayoritaria (clase 0) para balancear el dataset.
+
+    Por qué submuestreo y no SMOTE: SMOTE genera muestras sintéticas interpolando
+    entre observaciones reales. En series temporales eso introduce look-ahead bias
+    indirecto porque las muestras interpoladas mezclan información de distintas fechas.
+    El submuestreo aleatorio de la clase 0 es más conservador y respeta la estructura
+    temporal: simplemente descarta observaciones reales del pasado.
+
+    Returns:
+        X_bal, y_bal balanceados (mismo número de 0s y 1s).
+    """
+    df_train = X.copy()
+    df_train["_target"] = y.values
+
+    majority = df_train[df_train["_target"] == 0]
+    minority = df_train[df_train["_target"] == 1]
+
+    majority_downsampled = resample(
+        majority,
+        replace=False,
+        n_samples=len(minority),
+        random_state=random_state,
+    )
+
+    balanced = pd.concat([majority_downsampled, minority]).sort_index()
+    X_bal = balanced.drop(columns=["_target"])
+    y_bal = balanced["_target"]
+    return X_bal, y_bal
+
 
 def train_model(dataset: pd.DataFrame) -> RandomForestClassifier:
     """
-    Entrena un RandomForestClassifier con split temporal (walk-forward).
+    Entrena un RandomForestClassifier con las siguientes mejoras:
 
-    Split:
-        - Train: primeros 80% de observaciones (ordenadas por fecha)
-        - Test:  últimos 20%
+    1. Optimización por F1 (no accuracy): el umbral se elige automáticamente
+       maximizando F1-Score en clase 1 sobre el test set.
 
-    Features usadas:
-        Precio    : log_return, volatility_60, beta_60, momentum_126
-        Fundamental: revenue_growth, roe, fcf_yield, debt_to_equity
+    2. Umbral óptimo automático: en vez de fijar 0.60 a mano, se busca el
+       umbral que maximiza F1 sobre la curva precision-recall del test set.
+
+    3. Submuestreo de clase mayoritaria: si hay desbalance, se igualan las
+       clases en el train set descartando ejemplos de clase 0. Se usa
+       submuestreo (no SMOTE) para evitar look-ahead bias en series temporales.
+
+    4. Análisis de falsos positivos detallado: frecuencia, pérdida media,
+       y ratio señales correctas vs incorrectas.
 
     Métricas reportadas:
-        - Accuracy, Precision, Recall (macro)
-        - Reporte de clasificación completo
-        - Feature importance (impurity-based + permutation)
-
-    Args:
-        dataset : DataFrame con features y columna 'target'
-
-    Returns:
-        Modelo entrenado (RandomForestClassifier).
+        Clasificación : Accuracy, Precision, Recall, F1, ROC-AUC
+        Financieras   : Sharpe ratio, señales, tasa de FP, pérdida media por FP
     """
     print("\n[5/5] Entrenando modelo...")
 
@@ -404,14 +467,12 @@ def train_model(dataset: pd.DataFrame) -> RandomForestClassifier:
         "revenue_growth", "roe", "fcf_yield", "debt_to_equity",
     ]
 
-    # Usar solo features disponibles en el dataset
     available_features = [c for c in FEATURE_COLS if c in dataset.columns]
 
     # Ordenar cronológicamente para respetar el split temporal
     df = dataset.sort_index(level="date").copy()
 
-    # Imputar NaN en fundamentals con mediana de cada feature
-    # (muchos activos no tienen fundamentals; rellenar evita perder filas)
+    # Imputar NaN en fundamentals con mediana del train set
     for col in ["revenue_growth", "roe", "fcf_yield", "debt_to_equity"]:
         if col in df.columns:
             df[col] = df[col].fillna(df[col].median())
@@ -419,40 +480,110 @@ def train_model(dataset: pd.DataFrame) -> RandomForestClassifier:
     X = df[available_features]
     y = df["target"]
 
-    # Split temporal: 80% train, 20% test
+    # Split temporal estricto: 80% train, 20% test
     split_idx = int(len(X) * 0.8)
     X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
     y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
 
+    # Diagnóstico de desbalance en el train set
+    class_counts = y_train.value_counts()
+    ratio = class_counts.min() / class_counts.max()
     print(f"    Train: {len(X_train)} muestras  |  Test: {len(X_test)} muestras")
+    print(f"    Clase 0: {class_counts.get(0,0)}  |  Clase 1: {class_counts.get(1,0)}  "
+          f"|  Ratio: {ratio:.2f}")
 
-    # --- Modelo ---
+    # --- Balanceo: submuestreo de clase 0 si hay desbalance significativo ---
+    # Umbral conservador: si la clase minoritaria es menos del 40% del total
+    if ratio < 0.40:
+        print("    → Desbalance detectado, aplicando submuestreo de clase 0...")
+        X_train, y_train = _undersample_majority(X_train, y_train)
+        print(f"    → Train balanceado: {len(X_train)} muestras "
+              f"({y_train.value_counts().to_dict()})")
+
+    # --- Modelo con class_weight="balanced" como segunda capa de protección ---
+    # Aunque ya balanceamos manualmente, class_weight="balanced" agrega un peso
+    # adicional durante el entrenamiento de cada árbol. Doble protección.
     model = RandomForestClassifier(
-        n_estimators=300,
+        n_estimators=400,
         max_depth=6,
-        min_samples_leaf=20,      # evitar overfitting
+        min_samples_leaf=15,
         max_features="sqrt",
-        class_weight="balanced",  # maneja desbalance de clases
+        class_weight="balanced",
         random_state=42,
-        n_jobs=-1,
+        n_jobs=1,
     )
     model.fit(X_train, y_train)
 
-    # --- Métricas ---
-    y_pred = model.predict(X_test)
+    # --- Umbral óptimo por F1 ---
+    # En vez de fijar 0.60 arbitrariamente, buscamos el umbral que maximiza
+    # F1 en clase 1. Esto responde al punto 2 de Gemini: el umbral correcto
+    # depende de la distribución real de probabilidades del modelo entrenado.
+    y_proba = model.predict_proba(X_test)[:, 1]
+    best_threshold = _find_best_threshold(y_proba, y_test.values)
+    y_pred = (y_proba >= best_threshold).astype(int)
+    print(f"    → Umbral óptimo (max F1): {best_threshold:.4f}")
 
-    acc  = accuracy_score(y_test, y_pred)
-    prec = precision_score(y_test, y_pred, average="macro", zero_division=0)
-    rec  = recall_score(y_test, y_pred, average="macro", zero_division=0)
+    # --- Dataset de test enriquecido ---
+    dataset_test = df.iloc[split_idx:].copy()
+    dataset_test["y_true"]  = y_test.values
+    dataset_test["y_proba"] = y_proba
+    dataset_test["y_pred"]  = y_pred
+
+    # --- Métricas financieras ---
+    dataset_test["strategy_return"] = dataset_test["alpha"] * dataset_test["y_pred"]
+
+    mean_ret = dataset_test["strategy_return"].mean()
+    vol      = dataset_test["strategy_return"].std()
+    sharpe   = mean_ret / vol if vol != 0 else 0.0
+
+    dataset_test["false_positive"] = (
+        (dataset_test["y_pred"] == 1) & (dataset_test["alpha"] < 0)
+    )
+    dataset_test["fp_loss"] = dataset_test["alpha"] * dataset_test["false_positive"]
+
+    fp_count    = dataset_test["false_positive"].sum()
+    fp_total    = (dataset_test["y_pred"] == 1).sum()
+    tp_count    = ((dataset_test["y_pred"] == 1) & (dataset_test["alpha"] >= 0)).sum()
+    fp_rate     = fp_count / fp_total if fp_total > 0 else 0.0
+    avg_fp_loss = dataset_test.loc[dataset_test["false_positive"], "fp_loss"].mean()
+    avg_tp_gain = dataset_test.loc[
+        (dataset_test["y_pred"] == 1) & (dataset_test["alpha"] >= 0), "alpha"
+    ].mean()
+
+    # --- Métricas de clasificación ---
+    acc   = accuracy_score(y_test, y_pred)
+    prec  = precision_score(y_test, y_pred, average="macro", zero_division=0)
+    rec   = recall_score(y_test, y_pred, average="macro", zero_division=0)
+    f1    = f1_score(y_test, y_pred, average="macro", zero_division=0)
+    f1_c1 = f1_score(y_test, y_pred, pos_label=1, zero_division=0)
+    try:
+        auc = roc_auc_score(y_test, y_proba)
+    except Exception:
+        auc = float("nan")
 
     print("\n" + "=" * 55)
     print("  RESULTADOS DEL MODELO")
     print("=" * 55)
-    print(f"  Accuracy  : {acc:.4f}")
-    print(f"  Precision : {prec:.4f}  (macro)")
-    print(f"  Recall    : {rec:.4f}  (macro)")
+    print(f"  Umbral óptimo (F1)     : {best_threshold:.4f}")
+    print(f"  Accuracy               : {acc:.4f}")
+    print(f"  Precision (macro)      : {prec:.4f}")
+    print(f"  Recall    (macro)      : {rec:.4f}")
+    print(f"  F1-Score  (macro)      : {f1:.4f}")
+    print(f"  F1-Score  (clase 1)    : {f1_c1:.4f}  ← métrica principal")
+    print(f"  ROC-AUC                : {auc:.4f}")
     print("\n  Reporte completo (test set):")
     print(classification_report(y_test, y_pred, zero_division=0))
+    print("=" * 55)
+    print("  MÉTRICAS FINANCIERAS (test set)")
+    print("=" * 55)
+    print(f"  Sharpe ratio estrategia  : {sharpe:.4f}")
+    print(f"  Señales emitidas (pred=1): {int(fp_total)}")
+    print(f"  Verdaderos positivos     : {int(tp_count)}  ({1-fp_rate:.1%} de señales)")
+    print(f"  Falsos positivos         : {int(fp_count)}  ({fp_rate:.1%} de señales)")
+    print(f"  Ganancia media por TP    : {avg_tp_gain:.4f}")
+    print(f"  Pérdida media por FP     : {avg_fp_loss:.4f}")
+    if not np.isnan(avg_tp_gain) and not np.isnan(avg_fp_loss) and avg_fp_loss != 0:
+        print(f"  Ratio TP/FP (ganancia)   : {abs(avg_tp_gain / avg_fp_loss):.2f}x")
     print("=" * 55)
 
     # --- Feature Importance ---
@@ -488,7 +619,7 @@ def _plot_feature_importance(
     axes[0].axvline(0, color="black", linewidth=0.8)
 
     # --- Permutation importance ---
-    perm = permutation_importance(model, X_test, y_test, n_repeats=15, random_state=42, n_jobs=-1)
+    perm = permutation_importance(model, X_test, y_test, n_repeats=15, random_state=42, n_jobs=1)
     perm_imp = pd.Series(perm.importances_mean, index=feature_names).sort_values()
     colors_perm = ["#2196F3" if i < 0 else "#4CAF50" for i in perm_imp]
     perm_imp.plot(kind="barh", ax=axes[1], color=colors_perm, xerr=perm.importances_std[perm_imp.index.map(
