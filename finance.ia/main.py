@@ -56,7 +56,7 @@ BENCHMARK    = "SPY"
 START_DATE   = "2015-01-01"
 END_DATE     = pd.Timestamp.today().strftime("%Y-%m-%d")
 HORIZON      = 63          # días hábiles ≈ 3 meses
-VOL_WINDOW   = 60          # ventana para volatilidad y beta rolling
+VOL_WINDOW   = 90          # ventana para volatilidad y beta rolling
 MOM_WINDOW   = 126         # ventana para momentum 6 meses
 
 
@@ -352,7 +352,7 @@ def build_target(prices: pd.DataFrame, features: pd.DataFrame) -> pd.DataFrame:
         ticker_forward = np.log(prices[ticker].shift(-HORIZON) / prices[ticker])
         
         # Comparar retorno futuro del activo vs SPY
-        ALPHA_THRESHOLD = 0.005  # 0.5%
+        ALPHA_THRESHOLD = 0.03  # 3%
 
         alpha = ticker_forward - spy_forward
         outperforms = (alpha > ALPHA_THRESHOLD).astype(float)
@@ -463,8 +463,8 @@ def train_model(dataset: pd.DataFrame) -> RandomForestClassifier:
     print("\n[5/5] Entrenando modelo...")
 
     FEATURE_COLS = [
-        "log_return", "volatility_60", "beta_60", "momentum_126",
-        "revenue_growth", "roe", "fcf_yield", "debt_to_equity",
+        "beta_60", "momentum_126",
+        "revenue_growth",
     ]
 
     available_features = [c for c in FEATURE_COLS if c in dataset.columns]
@@ -531,19 +531,33 @@ def train_model(dataset: pd.DataFrame) -> RandomForestClassifier:
 
     # --- Métricas financieras ---
     dataset_test["strategy_return"] = dataset_test["alpha"] * dataset_test["y_pred"]
+    # --- Aplicar Filtro de Volatilidad ---
+    VOL_LIMIT = 0.35  # Filtro: No operamos si la vol es > 35%
+
+# Creamos una máscara: queremos pred=1 Y volatilidad bajo el límite
+# Esto reemplaza tu y_pred original solo para la ejecución financiera
+    dataset_test["y_pred_filtered"] = (
+    (dataset_test["y_pred"] == 1) & 
+    (dataset_test["volatility_60"] <= VOL_LIMIT)
+    ).astype(int)
+
+# Ahora calculamos el retorno con la señal filtrada
+    dataset_test["strategy_return"] = dataset_test["alpha"] * dataset_test["y_pred_filtered"]
 
     mean_ret = dataset_test["strategy_return"].mean()
     vol      = dataset_test["strategy_return"].std()
     sharpe   = mean_ret / vol if vol != 0 else 0.0
 
     dataset_test["false_positive"] = (
-        (dataset_test["y_pred"] == 1) & (dataset_test["alpha"] < 0)
+        (dataset_test["y_pred_filtered"] == 1) & (dataset_test["alpha"] < 0)
     )
     dataset_test["fp_loss"] = dataset_test["alpha"] * dataset_test["false_positive"]
 
-    fp_count    = dataset_test["false_positive"].sum()
+    tp_count = ((dataset_test["y_pred_filtered"] == 1) & (dataset_test["alpha"] >= 0)).sum()
+    fp_count = dataset_test["false_positive"].sum()
+    
     fp_total    = (dataset_test["y_pred"] == 1).sum()
-    tp_count    = ((dataset_test["y_pred"] == 1) & (dataset_test["alpha"] >= 0)).sum()
+   
     fp_rate     = fp_count / fp_total if fp_total > 0 else 0.0
     avg_fp_loss = dataset_test.loc[dataset_test["false_positive"], "fp_loss"].mean()
     avg_tp_gain = dataset_test.loc[
