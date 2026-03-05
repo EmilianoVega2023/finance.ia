@@ -1,4 +1,7 @@
----------------------------------------------------------------------------------------------
+
+Sobre las dependencias pagas — tenés razón en que hay mucho ruido en ese mundo, pero también hay alternativas realmente buenas y gratuitas. yfinance para datos de mercado, scikit-learn para el Random Forest que ya conocés, y para la parte de agente LangChain tiene una versión open source que no requiere APIs pagas si la conectás con un modelo local o con la API gratuita de Groq por ejemplo. No es lo mismo que GPT-4 pero para análisis financiero estructurado alcanza.
+
+-------------------------------------------------
 
 DIA 1
 
